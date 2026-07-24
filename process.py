@@ -2,6 +2,52 @@
 import librosa
 import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import hashlib
+from pathlib import Path
+
+def get_file_cache_key(file_path):
+    """
+    파일 크기(size)와 마지막 수정 시간(mtime)을 조합하여 고유 해시 생성
+    (파일 전체를 읽지 않고 메타데이터만 확인하므로 속도가 극도로 빠름)
+    """
+    p = Path(file_path)
+    stat = p.stat()
+    key_str = f"{p.name}_{stat.st_size}_{stat.st_mtime}"
+
+    return hashlib.md5(key_str.encode('utf-8')).hexdigest()
+
+def extract_robust_features_cached(audio_path, cache_dir=".cache", target_sr=11025, hop_length=512):
+    """
+    캐시 파일(.npz)이 존재하면 즉시 로드하고, 없으면 피처 연산 후 저장합니다.
+    """
+    cache_folder = Path(cache_dir)
+    cache_folder.mkdir(parents=True, exist_ok=True)
+    
+    # 1. 파일 고유 캐시 경로 생성 (.cache/해시값.npz)
+    cache_key = get_file_cache_key(audio_path)
+    cache_file = cache_folder / f"{cache_key}.npz"
+    
+    # 2. [캐시 HIT] 파일이 이미 존재하면 바이너리 로드 (0.01초 소요)
+    if cache_file.exists():
+        try:
+            data = np.load(cache_file)
+            return data["chroma_sync"], data["beat_times"], float(data["duration"])
+        except Exception:
+            # 캐시 파일이 손상되었을 경우 재계산 유도
+            pass
+
+    # 3. [캐시 MISS] 캐시가 없으면 피처 연산 수행
+    chroma_sync, beat_times, duration = extract_robust_features_fast(audio_path, target_sr, hop_length)
+    
+    # 4. 연산 결과를 압축 바이너리로 캐시 저장
+    np.savez_compressed(
+        cache_file,
+        chroma_sync=chroma_sync,
+        beat_times=beat_times,
+        duration=np.array(duration)
+    )
+    
+    return chroma_sync, beat_times, duration
 
 def extract_robust_features_fast(audio_path, target_sr=11025, hop_length=512):
     """
@@ -43,7 +89,7 @@ def _process_single_B_worker(args):
     
     try:
         # 1. B 음원 피처 추출
-        chroma_B, beats_B, dur_B = extract_robust_features_fast(path_B)
+        chroma_B, beats_B, dur_B = extract_robust_features_cached(path_B)
         N_B = chroma_B.shape[1]
         
         # 2. 12가지 피치 변조 DTW 비교 (단일 프로세스 내부 연산)
@@ -135,7 +181,7 @@ def analyze_1_to_n_match_parallel(path_A, paths_B, cost_threshold=0.15, min_cove
     
     # 1. 기준 곡 A 피처 추출 (메인 프로세스에서 1회 수행)
     print("기준 곡(A) 피처 추출 및 캐싱 중...")
-    chroma_A, beats_A, dur_A = extract_robust_features_fast(path_A)
+    chroma_A, beats_A, dur_A = extract_robust_features_cached(path_A)
     N_A = chroma_A.shape[1]
     
     # 2. 각 작업 프로세스에 전달할 인자 작업 튜플 생성
