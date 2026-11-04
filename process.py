@@ -1,209 +1,222 @@
 ﻿import os
+import hashlib
+import json
+import tempfile
+import warnings
+import zipfile
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import librosa
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import hashlib
-from pathlib import Path
+from scipy.spatial.distance import cdist
+from numba import njit
+from threadpoolctl import threadpool_limits
+
 
 def get_file_cache_key(file_path):
-    """
-    파일 크기(size)와 마지막 수정 시간(mtime)을 조합하여 고유 해시 생성
-    (파일 전체를 읽지 않고 메타데이터만 확인하므로 속도가 극도로 빠름)
-    """
-    p = Path(file_path)
+    p = Path(file_path).resolve()
     stat = p.stat()
-    key_str = f"{p.name}_{stat.st_size}_{stat.st_mtime}"
-
+    key_str = f'{p}_{stat.st_size}_{stat.st_mtime_ns}'
     return hashlib.md5(key_str.encode('utf-8')).hexdigest()
 
-def extract_robust_features_cached(audio_path, cache_dir=".cache", target_sr=11025, hop_length=512):
-    """
-    캐시 파일(.npz)이 존재하면 즉시 로드하고, 없으면 피처 연산 후 저장합니다.
-    """
-    cache_folder = Path(cache_dir)
-    cache_folder.mkdir(parents=True, exist_ok=True)
-    
-    # 1. 파일 고유 캐시 경로 생성 (.cache/해시값.npz)
-    cache_key = get_file_cache_key(audio_path)
-    cache_file = cache_folder / f"{cache_key}.npz"
-    
-    # 2. [캐시 HIT] 파일이 이미 존재하면 바이너리 로드 (0.01초 소요)
-    if cache_file.exists():
-        try:
-            data = np.load(cache_file)
-            return data["chroma_sync"], data["beat_times"], float(data["duration"])
-        except Exception:
-            # 캐시 파일이 손상되었을 경우 재계산 유도
-            pass
 
-    # 3. [캐시 MISS] 캐시가 없으면 피처 연산 수행
-    chroma_sync, beat_times, duration = extract_robust_features_fast(audio_path, target_sr, hop_length)
-    
-    # 4. 연산 결과를 압축 바이너리로 캐시 저장
-    np.savez_compressed(
-        cache_file,
-        chroma_sync=chroma_sync,
-        beat_times=beat_times,
-        duration=np.array(duration)
-    )
-    
-    return chroma_sync, beat_times, duration
+def _feature_cache_key(audio_path, target_sr, hop_length):
+    payload = [get_file_cache_key(audio_path), target_sr, hop_length,
+               'qt-compatible-v1', librosa.__version__, np.__version__]
+    return hashlib.sha256(json.dumps(payload).encode()).hexdigest()
+
+
+def extract_robust_features_cached(audio_path, cache_dir='.cache', target_sr=11025, hop_length=512):
+    """기존과 동일하게 (chroma_sync, beat_times, duration) 반환."""
+    folder = Path(cache_dir)
+    folder.mkdir(parents=True, exist_ok=True)
+    key = _feature_cache_key(audio_path, target_sr, hop_length)
+    dest = folder / f'{key}.npz'
+    if dest.exists():
+        try:
+            with np.load(dest, allow_pickle=False) as d:
+                x, times, duration = d['chroma_sync'], d['beat_times'], float(d['duration'])
+            if (x.ndim != 2 or x.shape[0] != 12 or x.shape[1] == 0 or
+                times.ndim != 1 or not np.isfinite(x).all() or
+                not np.isfinite(times).all() or not np.isfinite(duration) or duration <= 0):
+                raise ValueError('잘못된 캐시')
+            return x, times, duration
+        except (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile):
+            pass
+    result = extract_robust_features_fast(audio_path, target_sr, hop_length)
+    if key != _feature_cache_key(audio_path, target_sr, hop_length):
+        raise RuntimeError('분석 중 음원 파일이 변경되었습니다')
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=folder, suffix='.npz', delete=False) as f:
+            tmp = Path(f.name)
+            np.savez(f, chroma_sync=result[0], beat_times=result[1], duration=np.array(result[2]))
+        os.replace(tmp, dest)
+    except OSError as e:
+        warnings.warn(f'캐시 저장 실패, 계산 결과는 사용: {e}')
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+    return result
+
 
 def extract_robust_features_fast(audio_path, target_sr=11025, hop_length=512):
-    """
-    고속 피처 추출 (Chroma CQT + L2 Normalization)
-    """
-    y, sr = librosa.load(audio_path, sr=target_sr, mono=True, res_type="kaiser_fast")
+    """원본 피처 및 beat_times 계산을 유지하여 기존 Qt 코드와 호환."""
+    y, sr = librosa.load(audio_path, sr=target_sr, mono=True, res_type='kaiser_fast')
     duration = len(y) / sr
-    
-    # 1. STFT & HPSS
+    if duration <= 0 or not np.isfinite(y).all():
+        raise ValueError('빈 음원 또는 비정상 샘플')
     S = np.abs(librosa.stft(y, n_fft=2048, hop_length=hop_length))
-    S_harmonic, _ = librosa.decompose.hpss(S)
-    
-    # 2. 비트 트래킹
-    onset_env = librosa.onset.onset_strength(S=S_harmonic, sr=sr, hop_length=hop_length)
-    tempo, beat_frames = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, hop_length=hop_length)
-    
-    # 3. Chroma STFT + L2 Normalization
-    chroma_raw = librosa.feature.chroma_stft(S=S_harmonic, sr=sr, hop_length=hop_length)
-    chroma = librosa.util.normalize(chroma_raw, norm=2, axis=0)
-    
-    # 4. 비트 동기화
-    if len(beat_frames) > 0:
-        chroma_sync = librosa.util.sync(chroma, beat_frames, aggregate=np.median)
-        beat_times = librosa.frames_to_time(beat_frames, sr=sr, hop_length=hop_length)
+    H, _ = librosa.decompose.hpss(S)
+    onset = librosa.onset.onset_strength(S=H, sr=sr, hop_length=hop_length)
+    _, beats = librosa.beat.beat_track(onset_envelope=onset, sr=sr, hop_length=hop_length)
+    raw = librosa.feature.chroma_stft(S=H, sr=sr, hop_length=hop_length)
+    chroma = librosa.util.normalize(raw, norm=2, axis=0)
+    if len(beats):
+        synced = librosa.util.sync(chroma, beats, aggregate=np.median)
+        times = librosa.frames_to_time(beats, sr=sr, hop_length=hop_length)
     else:
-        chroma_sync = chroma
-        beat_times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop_length)
-        
-    return chroma_sync, beat_times, duration
+        synced = chroma
+        times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=sr, hop_length=hop_length)
+    return synced, times, duration
+
+@njit(cache=True, nogil=True)
+def _dtw_summary(C):
+    """기본 steps=(1,1),(0,1),(1,0), 유클리드 비음수 비용 전용.
+    librosa.dtw(C=C, subseq=True)의 최저 누적 비용 끝점과 같은 선택.
+    평균 비용 자체를 전역 최적화하는 알고리즘은 아님.
+    C 외 DP 메모리는 O(N_B); 전체 wp는 반환하지 않음.
+    """
+    n, m = C.shape
+    prev = C[0].copy()
+    curr = np.empty(m, np.float64)
+    lengths = np.ones(m, np.int64)
+    next_lengths = np.empty(m, np.int64)
+    starts = np.arange(m)
+    next_starts = np.empty(m, np.int64)
+    for i in range(1, n):
+        curr[0] = prev[0] + C[i, 0]
+        next_lengths[0] = lengths[0] + 1
+        next_starts[0] = starts[0]
+        for j in range(1, m):
+            # 비교는 합산 후: librosa와 동일한 동률 우선순위.
+            best = prev[j-1] + C[i, j]
+            length = lengths[j-1]
+            start = starts[j-1]
+            left = curr[j-1] + C[i, j]
+            if left < best:
+                best, length, start = left, next_lengths[j-1], next_starts[j-1]
+            up = prev[j] + C[i, j]
+            if up < best:
+                best, length, start = up, lengths[j], starts[j]
+            curr[j], next_lengths[j], next_starts[j] = best, length+1, start
+        prev, curr = curr, prev
+        lengths, next_lengths = next_lengths, lengths
+        starts, next_starts = next_starts, starts
+    end = np.argmin(prev)
+    return prev[end] / lengths[end], starts[end], end, lengths[end]
+
+
+def _prepare_shifts(chroma_A):
+    return tuple(np.ascontiguousarray(np.roll(chroma_A, s, axis=0).T, dtype=np.float64)
+                 for s in range(12))
+
+
+def _compare_single_B(path_B, a_shifts, N_A, cost_threshold, min_coverage):
+    filename_B = os.path.basename(path_B)
+    try:
+        chroma_B, beats_B, dur_B = extract_robust_features_cached(path_B)
+        N_B = chroma_B.shape[1]
+        b = np.ascontiguousarray(chroma_B.T, dtype=np.float64)
+        costs = np.empty((N_A, N_B), dtype=np.float64)
+        best = None
+        for shift, a in enumerate(a_shifts):
+            if a.shape != (N_A, 12):
+                raise ValueError('N_A와 chroma_A 크기가 다릅니다')
+            cdist(a, b, metric='euclidean', out=costs)
+            if N_A <= N_B:
+                score, begin, end, length = _dtw_summary(costs)
+            else:
+                # 기존 librosa X/Y 호출처럼 짧은 B 전체를 A 내부에 매칭.
+                # 원본의 D[-1, b_end_idx] 오인덱싱 대신 실제 끝점 비용 사용.
+                score, _, _, length = _dtw_summary(np.ascontiguousarray(costs.T))
+                begin, end = 0, N_B - 1
+            if best is None or score < best[0]:
+                best = (score, begin, end, length, shift)
+        best_cost, start_beat_B, end_beat_B, path_length, best_shift = best
+        matched_beats_B = end_beat_B - start_beat_B
+        coverage_ratio = matched_beats_B / max(N_A, 1)
+        slope = matched_beats_B / max(path_length, 1)
+        is_match = (best_cost <= cost_threshold and coverage_ratio >= min_coverage
+                    and 0.70 <= slope <= 1.45)
+        # 외부 시간 출력도 기존 기준을 유지.
+        start_time_B = beats_B[start_beat_B] if start_beat_B < len(beats_B) else dur_B
+        end_time_B = beats_B[end_beat_B] if end_beat_B < len(beats_B) else dur_B
+        pitch_change_msg = f'+{best_shift} semitones' if best_shift <= 6 else f'-{12-best_shift} semitones'
+        return {
+            'filename_B': filename_B,
+            'is_match': bool(is_match),
+            'cost': float(best_cost),
+            'coverage_pct': coverage_ratio * 100,
+            'slope': slope,
+            'start_pct': (start_time_B / dur_B) * 100,
+            'end_pct': (end_time_B / dur_B) * 100,
+            'start_time': start_time_B,
+            'end_time': end_time_B,
+            'dur_B': dur_B,
+            'pitch_msg': pitch_change_msg,
+            'status': 'success',
+        }
+    except Exception as e:
+        return {'filename_B': filename_B, 'is_match': False,
+                'cost': float('inf'), 'status': f'error: {e}'}
 
 
 def _process_single_B_worker(args):
-    """
-    [C#의 Parallel.ForEach 내부 람다 함수에 해당]
-    각 멀티프로세스 코어에서 B 파일 1개를 독립적으로 처리하는 작업 단위
-    """
+    """기존 튜플 (path_B, chroma_A, N_A, cost_threshold, min_coverage) 호환."""
     path_B, chroma_A, N_A, cost_threshold, min_coverage = args
-    filename_B = os.path.basename(path_B)
-    
     try:
-        # 1. B 음원 피처 추출
-        chroma_B, beats_B, dur_B = extract_robust_features_cached(path_B)
-        N_B = chroma_B.shape[1]
-        
-        # 2. 12가지 피치 변조 DTW 비교 (단일 프로세스 내부 연산)
-        best_cost = float('inf')
-        best_wp = None
-        best_shift = 0
-
-        for shift in range(12):
-            chroma_A_shifted = np.roll(chroma_A, shift, axis=0)
-            D, wp = librosa.sequence.dtw(X=chroma_A_shifted, Y=chroma_B, subseq=True)
-            
-            if np.max(wp[:, 0]) < N_A and np.max(wp[:, 1]) < N_B:
-                idx_A_col, idx_B_col = 0, 1
-            else:
-                idx_A_col, idx_B_col = 1, 0
-                
-            b_end_idx = wp[0, idx_B_col] if wp[0, idx_A_col] >= wp[-1, idx_A_col] else wp[-1, idx_B_col]
-            b_end_idx = min(int(b_end_idx), N_B - 1)
-            
-            path_cost = D[-1, b_end_idx] / len(wp)
-            
-            if path_cost < best_cost:
-                best_cost = path_cost
-                best_wp = wp
-                best_shift = shift
-
-        # 3. 매칭 검증
-        if np.max(best_wp[:, 0]) < N_A and np.max(best_wp[:, 1]) < N_B:
-            b_indices = best_wp[:, 1]
-        else:
-            b_indices = best_wp[:, 0]
-            
-        start_beat_B = int(np.min(b_indices))
-        end_beat_B = int(np.max(b_indices))
-        
-        matched_beats_B = abs(end_beat_B - start_beat_B)
-        coverage_ratio = matched_beats_B / max(N_A, 1)
-        slope = matched_beats_B / max(len(best_wp), 1)
-        
-        is_valid_cost = (best_cost <= cost_threshold)
-        is_valid_coverage = (coverage_ratio >= min_coverage)
-        is_valid_slope = (0.70 <= slope <= 1.45)
-        
-        is_match = is_valid_cost and is_valid_coverage and is_valid_slope
-        
-        start_time_B = beats_B[start_beat_B] if start_beat_B < len(beats_B) else dur_B
-        end_time_B = beats_B[end_beat_B] if end_beat_B < len(beats_B) else dur_B
-        
-        start_pct_B = (start_time_B / dur_B) * 100
-        end_pct_B = (end_time_B / dur_B) * 100
-        pitch_change_msg = f"+{best_shift} semitones" if best_shift <= 6 else f"-{12 - best_shift} semitones"
-        
-        return {
-            "filename_B": filename_B,
-            "is_match": is_match,
-            "cost": best_cost,
-            "coverage_pct": coverage_ratio * 100,
-            "slope": slope,
-            "start_pct": start_pct_B,
-            "end_pct": end_pct_B,
-            "start_time": start_time_B,
-            "end_time": end_time_B,
-            "dur_B": dur_B,
-            "pitch_msg": pitch_change_msg,
-            "status": "success"
-        }
-        
+        return _compare_single_B(path_B, _prepare_shifts(chroma_A), N_A,
+                                 cost_threshold, min_coverage)
     except Exception as e:
-        return {
-            "filename_B": filename_B,
-            "is_match": False,
-            "cost": float('inf'),
-            "status": f"error: {str(e)}"
-        }
+        return {'filename_B': os.path.basename(path_B), 'is_match': False,
+                'cost': float('inf'), 'status': f'error: {e}'}
 
 
 def analyze_1_to_n_match_parallel(path_A, paths_B, cost_threshold=0.15, min_coverage=0.50, max_workers=None):
+    """동기 함수: Qt의 기존 QThread/worker에서 호출. 결과 list[dict] 반환.
+    내부 ThreadPool + nogil DTW로 병렬 처리하며 main/프로세스 초기화 불필요.
     """
-    [C#의 Parallel.ForEach 대응] 
-    ProcessPoolExecutor를 활용해 N개의 B 음원 파일들을 CPU 코어별로 병렬 분산 처리합니다.
-    """
+    paths_B = list(paths_B)
+    if not paths_B:
+        return []
     if max_workers is None:
         max_workers = min(os.cpu_count() or 4, len(paths_B))
-        
-    print("="*75)
-    print(f" [병렬 분석 시작 - Parallel.ForEach] 기준 곡: {os.path.basename(path_A)}")
-    print(f" 사용 CPU 코어(프로세스 수): {max_workers}개 / 비교 파일 총 {len(paths_B)}개")
-    print("="*75)
-    
-    # 1. 기준 곡 A 피처 추출 (메인 프로세스에서 1회 수행)
-    print("기준 곡(A) 피처 추출 및 캐싱 중...")
-    chroma_A, beats_A, dur_A = extract_robust_features_cached(path_A)
-    N_A = chroma_A.shape[1]
-    
-    # 2. 각 작업 프로세스에 전달할 인자 작업 튜플 생성
-    tasks = [
-        (path_B, chroma_A, N_A, cost_threshold, min_coverage)
-        for path_B in paths_B
-    ]
-    
+    if max_workers < 1:
+        raise ValueError('max_workers는 1 이상이어야 합니다')
+    print('=' * 75)
+    print(f' [병렬 분석 시작 - Parallel.ForEach] 기준 곡: {os.path.basename(path_A)}')
+    print(f' 사용 작업 스레드: {max_workers}개 / 비교 파일 총 {len(paths_B)}개')
+    print('=' * 75)
+    print('기준 곡(A) 피처 추출 및 캐싱 중...')
     results_list = []
-    
-    # 3. [C# Parallel.ForEach] 멀티프로세스 풀 실행
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # 비동기 작업 제출
-        future_to_path = {executor.submit(_process_single_B_worker, task): task[0] for task in tasks}
-        
-        # 완료되는 순서대로 실시간 결과 수집 (Progress)
-        for completed_count, future in enumerate(as_completed(future_to_path), 1):
-            res = future.result()
-            results_list.append(res)
-            print(f"[{completed_count}/{len(paths_B)}] 완료: {res['filename_B']} (Cost: {res['cost']:.4f})")
-            
-    # 정렬: Match True 우선, Cost 낮은 순
-    results_list.sort(key=lambda x: (not x["is_match"], x["cost"]))
-            
+    # BLAS 내부 스레드와 작업 스레드의 과도한 중첩 방지.
+    with threadpool_limits(limits=1):
+        chroma_A, beats_A, dur_A = extract_robust_features_cached(path_A)
+        N_A = chroma_A.shape[1]
+        a_shifts = _prepare_shifts(chroma_A)
+        # 작업 시작 전 JIT 준비. 이후 핵심 DP는 GIL 없이 실행.
+        _dtw_summary(np.zeros((2, 2), dtype=np.float64))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_compare_single_B, p, a_shifts, N_A,
+                                       cost_threshold, min_coverage): p for p in paths_B}
+            for completed_count, future in enumerate(as_completed(futures), 1):
+                try:
+                    res = future.result()
+                except Exception as e:
+                    res = {'filename_B': os.path.basename(futures[future]),
+                           'is_match': False, 'cost': float('inf'), 'status': f'error: {e}'}
+                results_list.append(res)
+                print(f"[{completed_count}/{len(paths_B)}] 완료: {res['filename_B']} (Cost: {res['cost']:.4f})")
+    results_list.sort(key=lambda x: (not x['is_match'], x['cost']))
     return results_list
